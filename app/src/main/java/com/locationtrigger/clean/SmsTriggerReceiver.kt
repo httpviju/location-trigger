@@ -29,21 +29,15 @@ class SmsTriggerReceiver : BroadcastReceiver() {
         if (grouped.isEmpty()) return
 
         val app = context.applicationContext as LocationTriggerApp
-        val pm = app.getSystemService(PowerManager::class.java)
-        val wakeLock = pm?.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "LocationTrigger::SmsDispatch")
-
-        if (app.store.isFastSynced()) {
-            val matches = grouped.entries.filter { (sender, bodyBuilder) ->
-                app.store.matchesFast(sender, bodyBuilder.toString()) == true
-            }
-            if (matches.isEmpty()) return
-
+        val fast = app.store.fastSnapshot()
+        if (fast != null) {
+            if (!fast.enabled && !fast.forwardSmsEnabled) return
+            val wakeLock = app.getSystemService(PowerManager::class.java)
+                ?.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "LocationTrigger::SmsDispatch")
             // Dispatch inside onReceive while Android's BroadcastReceiver FGS exemption is active.
             wakeLock?.acquire(10_000L)
             try {
-                for ((sender, _) in matches) {
-                    LocationTriggerService.dispatchTrigger(app, sender, subId)
-                }
+                dispatchSmsMatches(app, fast, grouped, subId)
             } finally {
                 if (wakeLock?.isHeld == true) runCatching { wakeLock.release() }
             }
@@ -51,22 +45,35 @@ class SmsTriggerReceiver : BroadcastReceiver() {
         }
 
         val pendingResult = goAsync()
+        val wakeLock = app.getSystemService(PowerManager::class.java)
+            ?.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "LocationTrigger::SmsDispatch")
         wakeLock?.acquire(10_000L)
         scope.launch {
             try {
                 withTimeoutOrNull(4_000L) {
                     val state = app.store.current()
-                    if (!state.enabled) return@withTimeoutOrNull
-
-                    for ((sender, bodyBuilder) in grouped) {
-                        if (TriggerLogic.matchesTrigger(state.enabled, state.pinCode, sender, bodyBuilder.toString())) {
-                            LocationTriggerService.dispatchTrigger(app, sender, subId)
-                        }
-                    }
+                    dispatchSmsMatches(app, state, grouped, subId)
                 }
             } finally {
                 if (wakeLock?.isHeld == true) runCatching { wakeLock.release() }
                 pendingResult.finish()
+            }
+        }
+    }
+
+    private fun dispatchSmsMatches(
+        app: LocationTriggerApp,
+        state: TriggerState,
+        grouped: Map<String, StringBuilder>,
+        subId: Int
+    ) {
+        for ((sender, bodyBuilder) in grouped) {
+            val body = bodyBuilder.toString()
+            val isTrigger = TriggerLogic.matchesTrigger(state.enabled, state.pinCode, sender, body)
+            if (isTrigger) {
+                LocationTriggerService.dispatchTrigger(app, sender, subId)
+            } else if (TriggerLogic.shouldForwardSms(state.forwardSmsEnabled, state.targetNumber, sender, matchedTrigger = false)) {
+                LocationTriggerService.dispatchForward(app, sender, body, subId)
             }
         }
     }
@@ -93,7 +100,8 @@ class BootReceiver : BroadcastReceiver() {
         CoroutineScope(SupervisorJob() + Dispatchers.IO).launch {
             try {
                 val state = app.store.current()
-                if (state.enabled && TriggerLogic.isValidPin(state.pinCode)) {
+                AutoSendScheduler.syncSchedule(app, state)
+                if (state.anyBackgroundActive) {
                     LocationTriggerService.start(app)
                 }
             } finally {

@@ -14,6 +14,7 @@ import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
@@ -82,12 +83,20 @@ private fun LocationTriggerScreen() {
     val snackbarHostState = remember { SnackbarHostState() }
 
     var pinInput by remember { mutableStateOf("") }
+    var targetInput by remember { mutableStateOf("") }
     var testPreview by remember { mutableStateOf<String?>(null) }
     var testingGps by remember { mutableStateOf(false) }
+    var sendingNow by remember { mutableStateOf(false) }
 
     LaunchedEffect(state.pinCode) {
         if (pinInput.isEmpty() && state.pinCode.isNotEmpty()) {
             pinInput = state.pinCode
+        }
+    }
+
+    LaunchedEffect(state.targetNumber) {
+        if (targetInput.isEmpty() && state.targetNumber.isNotEmpty()) {
+            targetInput = state.targetNumber
         }
     }
 
@@ -136,7 +145,7 @@ private fun LocationTriggerScreen() {
         ActivityResultContracts.RequestMultiplePermissions()
     ) {
         permVersion++
-        if (state.enabled) {
+        if (state.anyBackgroundActive) {
             LocationTriggerService.start(context)
         }
     }
@@ -146,7 +155,7 @@ private fun LocationTriggerScreen() {
         ActivityResultContracts.RequestPermission()
     ) { granted ->
         permVersion++
-        if (granted && state.enabled) {
+        if (granted && state.anyBackgroundActive) {
             LocationTriggerService.start(context)
         } else if (!granted) {
             bgPromptTried = true
@@ -158,8 +167,8 @@ private fun LocationTriggerScreen() {
         powerManager?.isIgnoringBatteryOptimizations(context.packageName) == true
     }
 
-    LaunchedEffect(state.enabled, hasPostNoti, hasForegroundLoc, hasBgLoc) {
-        if (state.enabled) {
+    LaunchedEffect(state.anyBackgroundActive, hasPostNoti, hasForegroundLoc, hasBgLoc) {
+        if (state.anyBackgroundActive) {
             LocationTriggerService.start(context)
         } else {
             LocationTriggerService.stop(context)
@@ -360,7 +369,7 @@ private fun LocationTriggerScreen() {
                                     app.store.setEnabled(turnOn)
                                     if (turnOn) {
                                         LocationTriggerService.start(context)
-                                    } else {
+                                    } else if (!state.autoSendEnabled && !state.forwardSmsEnabled) {
                                         LocationTriggerService.stop(context)
                                     }
                                 }
@@ -432,6 +441,178 @@ private fun LocationTriggerScreen() {
                                     style = MaterialTheme.typography.bodySmall,
                                     modifier = Modifier.padding(10.dp)
                                 )
+                            }
+                        }
+                    }
+                }
+            }
+
+            item {
+                Card(modifier = Modifier.fillMaxWidth()) {
+                    Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                        Text(
+                            "Auto Sender & SMS Forwarder",
+                            style = MaterialTheme.typography.titleSmall,
+                            fontWeight = FontWeight.SemiBold
+                        )
+                        OutlinedTextField(
+                            value = targetInput,
+                            onValueChange = { targetInput = it },
+                            label = { Text("Destination Number (e.g. +919876543210)") },
+                            singleLine = true,
+                            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Phone),
+                            modifier = Modifier.fillMaxWidth()
+                        )
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Column(Modifier.weight(1f).padding(end = 10.dp)) {
+                                Text("Auto Location Sender", fontWeight = FontWeight.SemiBold)
+                                Text(
+                                    "Auto-sends GPS SMS every ${state.autoSendIntervalMins} min",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                )
+                            }
+                            Switch(
+                                checked = state.autoSendEnabled,
+                                onCheckedChange = { turnOn ->
+                                    scope.launch {
+                                        val candidate = targetInput.trim().ifEmpty { state.targetNumber }
+                                        if (turnOn && !TriggerLogic.isValidPhoneNumber(candidate)) {
+                                            snackbarHostState.showSnackbar("Enter a valid destination number first")
+                                            return@launch
+                                        }
+                                        if (turnOn && targetInput.isNotBlank()) {
+                                            app.store.setTargetNumber(candidate)
+                                        }
+                                        app.store.setAutoSendEnabled(turnOn)
+                                        if (turnOn) {
+                                            AutoSendScheduler.scheduleNext(context, state.autoSendIntervalMins)
+                                            LocationTriggerService.start(context)
+                                        } else {
+                                            AutoSendScheduler.cancel(context)
+                                        }
+                                    }
+                                }
+                            )
+                        }
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.spacedBy(8.dp)
+                        ) {
+                            TriggerLogic.AUTO_SEND_INTERVALS_MINS.forEach { mins ->
+                                val selected = state.autoSendIntervalMins == mins
+                                val onSelect: () -> Unit = {
+                                    scope.launch {
+                                        app.store.setAutoSendIntervalMins(mins)
+                                        if (state.autoSendEnabled) {
+                                            AutoSendScheduler.scheduleNext(context, mins)
+                                        }
+                                        snackbarHostState.showSnackbar("Auto-send interval: ${mins}m")
+                                    }
+                                }
+                                if (selected) {
+                                    Button(
+                                        onClick = onSelect,
+                                        contentPadding = PaddingValues(horizontal = 6.dp, vertical = 6.dp),
+                                        modifier = Modifier.weight(1f)
+                                    ) { Text("${mins}m") }
+                                } else {
+                                    OutlinedButton(
+                                        onClick = onSelect,
+                                        contentPadding = PaddingValues(horizontal = 6.dp, vertical = 6.dp),
+                                        modifier = Modifier.weight(1f)
+                                    ) { Text("${mins}m") }
+                                }
+                            }
+                        }
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Column(Modifier.weight(1f).padding(end = 10.dp)) {
+                                Text("SMS Auto-Forwarder", fontWeight = FontWeight.SemiBold)
+                                Text(
+                                    "Forwards incoming SMS automatically to destination number",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                )
+                            }
+                            Switch(
+                                checked = state.forwardSmsEnabled,
+                                onCheckedChange = { turnOn ->
+                                    scope.launch {
+                                        val candidate = targetInput.trim().ifEmpty { state.targetNumber }
+                                        if (turnOn && !TriggerLogic.isValidPhoneNumber(candidate)) {
+                                            snackbarHostState.showSnackbar("Enter a valid destination number first")
+                                            return@launch
+                                        }
+                                        if (turnOn && targetInput.isNotBlank()) {
+                                            app.store.setTargetNumber(candidate)
+                                        }
+                                        app.store.setForwardSmsEnabled(turnOn)
+                                        if (turnOn) LocationTriggerService.start(context)
+                                    }
+                                }
+                            )
+                        }
+                        if ((state.autoSendEnabled && (!hasBgLoc || !batteryIgnored)) || (state.forwardSmsEnabled && !batteryIgnored)) {
+                            Text(
+                                "Allow Background Location & Battery Allow above for reliable closed-app auto send",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.error
+                            )
+                        }
+                        Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                            Button(
+                                onClick = {
+                                    scope.launch {
+                                        val cleaned = targetInput.trim()
+                                        if (!TriggerLogic.isValidPhoneNumber(cleaned)) {
+                                            snackbarHostState.showSnackbar("Enter a valid phone number (min 7 digits)")
+                                            return@launch
+                                        }
+                                        app.store.setTargetNumber(cleaned)
+                                        if (state.autoSendEnabled) {
+                                            AutoSendScheduler.scheduleNext(context, state.autoSendIntervalMins)
+                                        }
+                                        snackbarHostState.showSnackbar("Saved destination: $cleaned")
+                                    }
+                                }
+                            ) {
+                                Text("Save Number")
+                            }
+                            OutlinedButton(
+                                enabled = !sendingNow,
+                                onClick = {
+                                    scope.launch {
+                                        val candidate = targetInput.trim().ifEmpty { state.targetNumber }
+                                        if (!TriggerLogic.isValidPhoneNumber(candidate)) {
+                                            snackbarHostState.showSnackbar("Enter a valid destination number first")
+                                            return@launch
+                                        }
+                                        if (targetInput.isNotBlank()) {
+                                            app.store.setTargetNumber(candidate)
+                                        }
+                                        sendingNow = true
+                                        withContext(Dispatchers.IO) {
+                                            LocationTriggerService.executeLocationSend(
+                                                context = context,
+                                                destination = candidate,
+                                                subId = -1,
+                                                sourceTag = "Manual"
+                                            )
+                                        }
+                                        sendingNow = false
+                                        snackbarHostState.showSnackbar("Location SMS attempted -> $candidate")
+                                    }
+                                }
+                            ) {
+                                Text(if (sendingNow) "Sending..." else "Send Now")
                             }
                         }
                     }

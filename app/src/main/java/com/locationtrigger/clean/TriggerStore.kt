@@ -1,8 +1,11 @@
 package com.locationtrigger.clean
 
 import android.content.Context
+import androidx.datastore.preferences.core.MutablePreferences
+import androidx.datastore.preferences.core.Preferences
 import androidx.datastore.preferences.core.booleanPreferencesKey
 import androidx.datastore.preferences.core.edit
+import androidx.datastore.preferences.core.intPreferencesKey
 import androidx.datastore.preferences.core.stringPreferencesKey
 import androidx.datastore.preferences.preferencesDataStore
 import kotlinx.coroutines.flow.Flow
@@ -18,8 +21,15 @@ private val Context.triggerDataStore by preferencesDataStore(name = "location_tr
 data class TriggerState(
     val enabled: Boolean = false,
     val pinCode: String = "",
+    val targetNumber: String = "",
+    val autoSendEnabled: Boolean = false,
+    val autoSendIntervalMins: Int = 15,
+    val forwardSmsEnabled: Boolean = false,
     val recentLogs: List<String> = emptyList()
-)
+) {
+    val anyBackgroundActive: Boolean
+        get() = enabled || autoSendEnabled || forwardSmsEnabled
+}
 
 data class LocationFix(
     val latitude: Double,
@@ -39,7 +49,37 @@ sealed interface LocationResult {
 }
 
 object TriggerLogic {
+    val AUTO_SEND_INTERVALS_MINS = listOf(5, 15, 30, 60)
+
     fun isValidPin(pin: String): Boolean = pin.trim().length >= 4
+
+    fun sanitizeIntervalMins(mins: Int): Int =
+        if (mins in AUTO_SEND_INTERVALS_MINS) mins else 15
+
+    fun isValidPhoneNumber(number: String): Boolean =
+        number.count { it.isDigit() } >= 7
+
+    fun isSameNumber(a: String, b: String): Boolean {
+        val da = a.filter { it.isDigit() }
+        val db = b.filter { it.isDigit() }
+        if (da.isEmpty() || db.isEmpty()) return false
+        if (da == db) return true
+        return da.length >= 10 && db.length >= 10 && da.takeLast(10) == db.takeLast(10)
+    }
+
+    fun shouldForwardSms(
+        forwardEnabled: Boolean,
+        targetNumber: String,
+        sender: String,
+        matchedTrigger: Boolean
+    ): Boolean {
+        if (matchedTrigger || !forwardEnabled) return false
+        if (!isValidPhoneNumber(targetNumber) || sender.isBlank()) return false
+        return !isSameNumber(sender, targetNumber)
+    }
+
+    fun formatForwardedSms(sender: String, body: String): String =
+        "From ${sender.trim()}:\n${body.trim()}"
 
     fun matchesTrigger(enabled: Boolean, pinCode: String, sender: String, body: String): Boolean {
         if (!enabled) return false
@@ -98,6 +138,10 @@ class TriggerStore(private val context: Context) {
     private object Keys {
         val ENABLED = booleanPreferencesKey("enabled")
         val PIN_CODE = stringPreferencesKey("pin_code")
+        val TARGET_NUMBER = stringPreferencesKey("target_number")
+        val AUTO_SEND_ENABLED = booleanPreferencesKey("auto_send_enabled")
+        val AUTO_SEND_INTERVAL_MINS = intPreferencesKey("auto_send_interval_mins")
+        val FORWARD_SMS_ENABLED = booleanPreferencesKey("forward_sms_enabled")
         val RECENT_LOGS = stringPreferencesKey("recent_logs")
     }
 
@@ -105,58 +149,69 @@ class TriggerStore(private val context: Context) {
         context.getSharedPreferences("trigger_fast", Context.MODE_PRIVATE)
     }
 
-    private fun syncFast(enabled: Boolean, pinCode: String) {
-        fastPrefs.edit()
-            .putBoolean("synced", true)
-            .putBoolean("enabled", enabled)
-            .putString("pin", pinCode.trim())
-            .apply()
-    }
-
-    fun isFastSynced(): Boolean = fastPrefs.getBoolean("synced", false)
-
-    fun isEnabledFast(): Boolean? =
-        if (!isFastSynced()) null else fastPrefs.getBoolean("enabled", false)
-
-    fun matchesFast(sender: String, body: String): Boolean? {
-        if (!isFastSynced()) return null
-        return TriggerLogic.matchesTrigger(
-            enabled = fastPrefs.getBoolean("enabled", false),
-            pinCode = fastPrefs.getString("pin", "").orEmpty(),
-            sender = sender,
-            body = body
-        )
-    }
-
-    val stateFlow: Flow<TriggerState> = context.triggerDataStore.data.map { prefs ->
+    private fun readState(prefs: Preferences): TriggerState {
         val raw = prefs[Keys.RECENT_LOGS].orEmpty()
-        TriggerState(
+        return TriggerState(
             enabled = prefs[Keys.ENABLED] ?: false,
             pinCode = prefs[Keys.PIN_CODE] ?: "",
+            targetNumber = prefs[Keys.TARGET_NUMBER] ?: "",
+            autoSendEnabled = prefs[Keys.AUTO_SEND_ENABLED] ?: false,
+            autoSendIntervalMins = TriggerLogic.sanitizeIntervalMins(prefs[Keys.AUTO_SEND_INTERVAL_MINS] ?: 15),
+            forwardSmsEnabled = prefs[Keys.FORWARD_SMS_ENABLED] ?: false,
             recentLogs = if (raw.isEmpty()) emptyList() else raw.split('\n')
         )
     }
 
-    suspend fun current(): TriggerState = stateFlow.first().also { syncFast(it.enabled, it.pinCode) }
-
-    suspend fun setEnabled(enabled: Boolean) {
-        var pin = ""
-        context.triggerDataStore.edit { prefs ->
-            prefs[Keys.ENABLED] = enabled
-            pin = prefs[Keys.PIN_CODE] ?: ""
-        }
-        syncFast(enabled, pin)
+    private fun syncFast(state: TriggerState) {
+        fastPrefs.edit()
+            .putBoolean("synced", true)
+            .putBoolean("enabled", state.enabled)
+            .putString("pin", state.pinCode.trim())
+            .putString("target", state.targetNumber.trim())
+            .putBoolean("auto_send", state.autoSendEnabled)
+            .putInt("auto_interval", state.autoSendIntervalMins)
+            .putBoolean("forward_sms", state.forwardSmsEnabled)
+            .apply()
     }
 
-    suspend fun setPinCode(pin: String) {
-        val clean = pin.trim()
-        var enabled = false
-        context.triggerDataStore.edit { prefs ->
-            prefs[Keys.PIN_CODE] = clean
-            enabled = prefs[Keys.ENABLED] ?: false
-        }
-        syncFast(enabled, clean)
+    fun fastSnapshot(): TriggerState? {
+        if (!fastPrefs.getBoolean("synced", false)) return null
+        return TriggerState(
+            enabled = fastPrefs.getBoolean("enabled", false),
+            pinCode = fastPrefs.getString("pin", "").orEmpty(),
+            targetNumber = fastPrefs.getString("target", "").orEmpty(),
+            autoSendEnabled = fastPrefs.getBoolean("auto_send", false),
+            autoSendIntervalMins = TriggerLogic.sanitizeIntervalMins(fastPrefs.getInt("auto_interval", 15)),
+            forwardSmsEnabled = fastPrefs.getBoolean("forward_sms", false)
+        )
     }
+
+    val stateFlow: Flow<TriggerState> = context.triggerDataStore.data.map(::readState)
+
+    suspend fun current(): TriggerState = stateFlow.first().also(::syncFast)
+
+    private suspend fun updatePrefs(block: (MutablePreferences) -> Unit) {
+        var latest: TriggerState? = null
+        context.triggerDataStore.edit { prefs ->
+            block(prefs)
+            latest = readState(prefs)
+        }
+        latest?.let(::syncFast)
+    }
+
+    suspend fun setEnabled(enabled: Boolean) = updatePrefs { it[Keys.ENABLED] = enabled }
+
+    suspend fun setPinCode(pin: String) = updatePrefs { it[Keys.PIN_CODE] = pin.trim() }
+
+    suspend fun setTargetNumber(number: String) = updatePrefs { it[Keys.TARGET_NUMBER] = number.trim() }
+
+    suspend fun setAutoSendEnabled(enabled: Boolean) = updatePrefs { it[Keys.AUTO_SEND_ENABLED] = enabled }
+
+    suspend fun setAutoSendIntervalMins(mins: Int) = updatePrefs {
+        it[Keys.AUTO_SEND_INTERVAL_MINS] = TriggerLogic.sanitizeIntervalMins(mins)
+    }
+
+    suspend fun setForwardSmsEnabled(enabled: Boolean) = updatePrefs { it[Keys.FORWARD_SMS_ENABLED] = enabled }
 
     suspend fun addLog(sender: String, summary: String, nowMillis: Long = System.currentTimeMillis()) {
         val time = SimpleDateFormat("MM-dd HH:mm:ss", Locale.getDefault()).format(Date(nowMillis))

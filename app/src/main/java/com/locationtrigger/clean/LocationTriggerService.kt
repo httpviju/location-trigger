@@ -29,29 +29,39 @@ class LocationTriggerService : Service() {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         if (intent?.action == ACTION_STOP) {
             scope.launch {
-                (application as LocationTriggerApp).store.setEnabled(false)
+                val app = application as LocationTriggerApp
+                app.store.setEnabled(false)
+                app.store.setAutoSendEnabled(false)
+                app.store.setForwardSmsEnabled(false)
+                AutoSendScheduler.cancel(app)
                 stopSelf()
             }
             return START_NOT_STICKY
         }
 
-        val sender = if (intent?.action == ACTION_HANDLE_TRIGGER) {
-            intent.getStringExtra(EXTRA_SENDER).orEmpty()
-        } else {
-            ""
-        }
+        val action = intent?.action.orEmpty()
+        val sender = intent?.getStringExtra(EXTRA_SENDER).orEmpty()
         val subId = intent?.getIntExtra(EXTRA_SUB_ID, -1) ?: -1
+        val body = intent?.getStringExtra(EXTRA_BODY).orEmpty()
 
         if (!ensureForeground()) {
-            if (sender.isNotBlank()) {
-                TriggerJobService.enqueue(applicationContext, sender, subId)
+            if (isWorkAction(action) && sender.isNotBlank()) {
+                TriggerJobService.enqueue(applicationContext, action, sender, subId, body)
             }
             stopSelf()
             return START_NOT_STICKY
         }
 
-        if (sender.isNotBlank()) {
-            scope.launch { executeTrigger(applicationContext, sender, subId) }
+        when (action) {
+            ACTION_HANDLE_TRIGGER -> if (sender.isNotBlank()) {
+                scope.launch { executeLocationSend(applicationContext, sender, subId, sourceTag = null) }
+            }
+            ACTION_AUTO_LOCATION -> if (sender.isNotBlank()) {
+                scope.launch { executeLocationSend(applicationContext, sender, subId = -1, sourceTag = "Auto") }
+            }
+            ACTION_FORWARD_SMS -> if (sender.isNotBlank()) {
+                scope.launch { executeForwardSms(applicationContext, sender, body, subId) }
+            }
         }
         return START_STICKY
     }
@@ -86,7 +96,7 @@ class LocationTriggerService : Service() {
     }
 
     override fun onTaskRemoved(rootIntent: Intent?) {
-        if ((application as LocationTriggerApp).store.isEnabledFast() == true) {
+        if ((application as LocationTriggerApp).store.fastSnapshot()?.anyBackgroundActive == true) {
             val restartIntent = Intent(applicationContext, LocationTriggerService::class.java)
             val pending = PendingIntent.getForegroundService(
                 applicationContext,
@@ -126,8 +136,8 @@ class LocationTriggerService : Service() {
         )
         return NotificationCompat.Builder(this, LocationTriggerApp.CHANNEL_SERVICE)
             .setSmallIcon(R.drawable.ic_launcher_foreground)
-            .setContentTitle("Location Trigger Active")
-            .setContentText("Listening for your trigger SMS in background")
+            .setContentTitle("Location Trigger & Auto Sender Active")
+            .setContentText("Running offline trigger, auto location & SMS forwarder")
             .setOngoing(true)
             .setContentIntent(openIntent)
             .addAction(0, "Stop", stopIntent)
@@ -137,9 +147,15 @@ class LocationTriggerService : Service() {
     companion object {
         private const val SERVICE_NOTIFICATION_ID = 101
         private const val ACTION_STOP = "com.locationtrigger.clean.STOP"
-        private const val ACTION_HANDLE_TRIGGER = "com.locationtrigger.clean.HANDLE_TRIGGER"
+        const val ACTION_HANDLE_TRIGGER = "com.locationtrigger.clean.HANDLE_TRIGGER"
+        const val ACTION_AUTO_LOCATION = "com.locationtrigger.clean.AUTO_LOCATION"
+        const val ACTION_FORWARD_SMS = "com.locationtrigger.clean.FORWARD_SMS"
         private const val EXTRA_SENDER = "sender"
         private const val EXTRA_SUB_ID = "sub_id"
+        private const val EXTRA_BODY = "body"
+
+        fun isWorkAction(action: String): Boolean =
+            action == ACTION_HANDLE_TRIGGER || action == ACTION_AUTO_LOCATION || action == ACTION_FORWARD_SMS
 
         fun start(context: Context) {
             runCatching {
@@ -153,22 +169,37 @@ class LocationTriggerService : Service() {
             }
         }
 
-        fun dispatchTrigger(context: Context, sender: String, subId: Int) {
+        fun dispatchTrigger(context: Context, sender: String, subId: Int) =
+            dispatch(context, ACTION_HANDLE_TRIGGER, sender, subId, "")
+
+        fun dispatchAutoLocation(context: Context, targetNumber: String) =
+            dispatch(context, ACTION_AUTO_LOCATION, targetNumber, -1, "")
+
+        fun dispatchForward(context: Context, sender: String, body: String, subId: Int) =
+            dispatch(context, ACTION_FORWARD_SMS, sender, subId, body)
+
+        private fun dispatch(context: Context, action: String, sender: String, subId: Int, body: String) {
             val intent = Intent(context, LocationTriggerService::class.java).apply {
-                action = ACTION_HANDLE_TRIGGER
+                this.action = action
                 putExtra(EXTRA_SENDER, sender)
                 putExtra(EXTRA_SUB_ID, subId)
+                if (body.isNotEmpty()) putExtra(EXTRA_BODY, body)
             }
             val started = runCatching {
                 ContextCompat.startForegroundService(context, intent)
                 true
             }.getOrDefault(false)
             if (!started) {
-                TriggerJobService.enqueue(context, sender, subId)
+                TriggerJobService.enqueue(context, action, sender, subId, body)
             }
         }
 
-        suspend fun executeTrigger(context: Context, sender: String, subId: Int) {
+        suspend fun executeLocationSend(
+            context: Context,
+            destination: String,
+            subId: Int,
+            sourceTag: String?
+        ) {
             val app = context.applicationContext as LocationTriggerApp
             val pm = app.getSystemService(PowerManager::class.java)
             val wakeLock = pm?.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "LocationTrigger::FetchFix")
@@ -177,26 +208,52 @@ class LocationTriggerService : Service() {
                 val locResult = OfflineLocationFetcher.fetchBestLocation(app, timeoutMs = 20_000L)
                 val battery = OfflineLocationFetcher.readBatteryPercent(app)
                 val replyText = TriggerLogic.formatLocationReply(locResult, battery)
-                val sendRes = SmsReplySender.sendSms(app, sender, replyText, subId)
+                val sendRes = SmsReplySender.sendSms(app, destination, replyText, subId)
+                val prefix = if (sourceTag != null) "$sourceTag: " else ""
                 val logSummary = if (sendRes.isSuccess) {
                     when (locResult) {
-                        is LocationResult.Found -> "Sent ${String.format(Locale.US, "%.4f,%.4f", locResult.fix.latitude, locResult.fix.longitude)} (±${locResult.fix.accuracyMeters.toInt()}m, Bat $battery%)"
-                        LocationResult.DeviceLocationOff -> "Replied: Phone Location is OFF"
-                        LocationResult.PermissionMissing -> "Replied: Location permission missing"
-                        LocationResult.BackgroundPermissionMissing -> "Replied: Background 'Allow all the time' missing"
-                        LocationResult.NoFixAvailable -> "Replied: No GPS signal"
+                        is LocationResult.Found -> "${prefix}Sent ${String.format(Locale.US, "%.4f,%.4f", locResult.fix.latitude, locResult.fix.longitude)} (±${locResult.fix.accuracyMeters.toInt()}m, Bat $battery%)"
+                        LocationResult.DeviceLocationOff -> "${prefix}Replied: Phone Location is OFF"
+                        LocationResult.PermissionMissing -> "${prefix}Replied: Location permission missing"
+                        LocationResult.BackgroundPermissionMissing -> "${prefix}Replied: Background 'Allow all the time' missing"
+                        LocationResult.NoFixAvailable -> "${prefix}Replied: No GPS signal"
                     }
                 } else {
-                    "Failed: ${sendRes.exceptionOrNull()?.message}"
+                    "${prefix}Failed: ${sendRes.exceptionOrNull()?.message}"
                 }
-                app.store.addLog(sender, logSummary)
-                postReplyNotification(app, sender, logSummary)
+                val title = if (sourceTag != null) "Auto Location to $destination" else "Location Requested by $destination"
+                app.store.addLog(destination, logSummary)
+                postAlertNotification(app, title, logSummary)
             } finally {
                 if (wakeLock?.isHeld == true) runCatching { wakeLock.release() }
             }
         }
 
-        private fun postReplyNotification(context: Context, sender: String, summary: String) {
+        suspend fun executeForwardSms(context: Context, sender: String, body: String, subId: Int) {
+            val app = context.applicationContext as LocationTriggerApp
+            val pm = app.getSystemService(PowerManager::class.java)
+            val wakeLock = pm?.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "LocationTrigger::ForwardSms")
+            wakeLock?.acquire(15_000L)
+            try {
+                val state = app.store.current()
+                if (!TriggerLogic.shouldForwardSms(state.forwardSmsEnabled, state.targetNumber, sender, matchedTrigger = false)) {
+                    return
+                }
+                val message = TriggerLogic.formatForwardedSms(sender, body)
+                val sendRes = SmsReplySender.sendSms(app, state.targetNumber, message, subId)
+                val summary = if (sendRes.isSuccess) {
+                    "Forwarded SMS (${body.length} chars) -> ${state.targetNumber}"
+                } else {
+                    "Forward failed: ${sendRes.exceptionOrNull()?.message}"
+                }
+                app.store.addLog(sender, summary)
+                postAlertNotification(app, "SMS Forwarded ($sender)", summary)
+            } finally {
+                if (wakeLock?.isHeld == true) runCatching { wakeLock.release() }
+            }
+        }
+
+        private fun postAlertNotification(context: Context, title: String, summary: String) {
             val manager = context.getSystemService(NotificationManager::class.java) ?: return
             val openIntent = PendingIntent.getActivity(
                 context,
@@ -206,7 +263,7 @@ class LocationTriggerService : Service() {
             )
             val alert = NotificationCompat.Builder(context, LocationTriggerApp.CHANNEL_ALERTS)
                 .setSmallIcon(R.drawable.ic_launcher_foreground)
-                .setContentTitle("Location Requested by $sender")
+                .setContentTitle(title)
                 .setContentText(summary)
                 .setAutoCancel(true)
                 .setContentIntent(openIntent)

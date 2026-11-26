@@ -33,6 +33,7 @@ data class LocationFix(
 sealed interface LocationResult {
     data class Found(val fix: LocationFix) : LocationResult
     data object PermissionMissing : LocationResult
+    data object BackgroundPermissionMissing : LocationResult
     data object DeviceLocationOff : LocationResult
     data object NoFixAvailable : LocationResult
 }
@@ -61,6 +62,8 @@ object TriggerLogic {
         return when (result) {
             is LocationResult.PermissionMissing ->
                 "Location permission not granted on phone.\nBattery: $batteryText\nTime: $timeText"
+            is LocationResult.BackgroundPermissionMissing ->
+                "Background location ('Allow all the time') not granted on phone.\nBattery: $batteryText\nTime: $timeText"
             is LocationResult.DeviceLocationOff ->
                 "Phone Location/GPS is turned OFF.\nBattery: $batteryText\nTime: $timeText"
             is LocationResult.NoFixAvailable ->
@@ -98,6 +101,33 @@ class TriggerStore(private val context: Context) {
         val RECENT_LOGS = stringPreferencesKey("recent_logs")
     }
 
+    private val fastPrefs by lazy {
+        context.getSharedPreferences("trigger_fast", Context.MODE_PRIVATE)
+    }
+
+    private fun syncFast(enabled: Boolean, pinCode: String) {
+        fastPrefs.edit()
+            .putBoolean("synced", true)
+            .putBoolean("enabled", enabled)
+            .putString("pin", pinCode.trim())
+            .apply()
+    }
+
+    fun isFastSynced(): Boolean = fastPrefs.getBoolean("synced", false)
+
+    fun isEnabledFast(): Boolean? =
+        if (!isFastSynced()) null else fastPrefs.getBoolean("enabled", false)
+
+    fun matchesFast(sender: String, body: String): Boolean? {
+        if (!isFastSynced()) return null
+        return TriggerLogic.matchesTrigger(
+            enabled = fastPrefs.getBoolean("enabled", false),
+            pinCode = fastPrefs.getString("pin", "").orEmpty(),
+            sender = sender,
+            body = body
+        )
+    }
+
     val stateFlow: Flow<TriggerState> = context.triggerDataStore.data.map { prefs ->
         val raw = prefs[Keys.RECENT_LOGS].orEmpty()
         TriggerState(
@@ -107,14 +137,25 @@ class TriggerStore(private val context: Context) {
         )
     }
 
-    suspend fun current(): TriggerState = stateFlow.first()
+    suspend fun current(): TriggerState = stateFlow.first().also { syncFast(it.enabled, it.pinCode) }
 
     suspend fun setEnabled(enabled: Boolean) {
-        context.triggerDataStore.edit { it[Keys.ENABLED] = enabled }
+        var pin = ""
+        context.triggerDataStore.edit { prefs ->
+            prefs[Keys.ENABLED] = enabled
+            pin = prefs[Keys.PIN_CODE] ?: ""
+        }
+        syncFast(enabled, pin)
     }
 
     suspend fun setPinCode(pin: String) {
-        context.triggerDataStore.edit { it[Keys.PIN_CODE] = pin.trim() }
+        val clean = pin.trim()
+        var enabled = false
+        context.triggerDataStore.edit { prefs ->
+            prefs[Keys.PIN_CODE] = clean
+            enabled = prefs[Keys.ENABLED] ?: false
+        }
+        syncFast(enabled, clean)
     }
 
     suspend fun addLog(sender: String, summary: String, nowMillis: Long = System.currentTimeMillis()) {

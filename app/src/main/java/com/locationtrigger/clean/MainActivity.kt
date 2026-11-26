@@ -136,15 +136,21 @@ private fun LocationTriggerScreen() {
         ActivityResultContracts.RequestMultiplePermissions()
     ) {
         permVersion++
-        if (state.enabled && hasPostNoti) {
+        if (state.enabled) {
             LocationTriggerService.start(context)
         }
     }
 
+    var bgPromptTried by remember { mutableStateOf(false) }
     val bgLocLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.RequestPermission()
-    ) {
+    ) { granted ->
         permVersion++
+        if (granted && state.enabled) {
+            LocationTriggerService.start(context)
+        } else if (!granted) {
+            bgPromptTried = true
+        }
     }
 
     val powerManager = context.getSystemService(PowerManager::class.java)
@@ -152,10 +158,10 @@ private fun LocationTriggerScreen() {
         powerManager?.isIgnoringBatteryOptimizations(context.packageName) == true
     }
 
-    LaunchedEffect(state.enabled, hasPostNoti, hasForegroundLoc) {
-        if (state.enabled && hasPostNoti) {
+    LaunchedEffect(state.enabled, hasPostNoti, hasForegroundLoc, hasBgLoc) {
+        if (state.enabled) {
             LocationTriggerService.start(context)
-        } else if (!state.enabled) {
+        } else {
             LocationTriggerService.stop(context)
         }
     }
@@ -209,18 +215,18 @@ private fun LocationTriggerScreen() {
                             )
                             Spacer(Modifier.height(6.dp))
                             Button(onClick = {
-                                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                                if (!bgPromptTried) {
+                                    bgLocLauncher.launch(Manifest.permission.ACCESS_BACKGROUND_LOCATION)
+                                } else {
                                     context.startActivity(
                                         Intent(
                                             Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
                                             Uri.parse("package:${context.packageName}")
                                         )
                                     )
-                                } else {
-                                    bgLocLauncher.launch(Manifest.permission.ACCESS_BACKGROUND_LOCATION)
                                 }
                             }) {
-                                Text("Open Location Settings")
+                                Text(if (!bgPromptTried) "Allow All The Time" else "Open App Settings")
                             }
                         }
                     }
@@ -331,6 +337,13 @@ private fun LocationTriggerScreen() {
                                 style = MaterialTheme.typography.bodySmall,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant
                             )
+                            if (state.enabled && (!hasBgLoc || !batteryIgnored)) {
+                                Text(
+                                    "Grant Background Location & Battery Allow above for closed-app replies",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.error
+                                )
+                            }
                         }
                         Switch(
                             checked = state.enabled,
@@ -345,9 +358,9 @@ private fun LocationTriggerScreen() {
                                         app.store.setPinCode(pinInput)
                                     }
                                     app.store.setEnabled(turnOn)
-                                    if (turnOn && hasPostNoti) {
+                                    if (turnOn) {
                                         LocationTriggerService.start(context)
-                                    } else if (!turnOn) {
+                                    } else {
                                         LocationTriggerService.stop(context)
                                     }
                                 }
@@ -384,7 +397,7 @@ private fun LocationTriggerScreen() {
                                         }
                                         app.store.setPinCode(cleaned)
                                         app.store.setEnabled(true)
-                                        if (hasPostNoti) LocationTriggerService.start(context)
+                                        LocationTriggerService.start(context)
                                         snackbarHostState.showSnackbar("Saved! SMS 'LOC $cleaned' to trigger")
                                     }
                                 }

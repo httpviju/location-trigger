@@ -2,6 +2,7 @@ package com.locationtrigger.clean
 
 import android.Manifest
 import android.annotation.SuppressLint
+import android.app.ActivityManager
 import android.content.Context
 import android.content.pm.PackageManager
 import android.location.Location
@@ -25,6 +26,16 @@ object OfflineLocationFetcher {
         val fine = ContextCompat.checkSelfPermission(context, Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED
         val coarse = ContextCompat.checkSelfPermission(context, Manifest.permission.ACCESS_COARSE_LOCATION) == PackageManager.PERMISSION_GRANTED
         return fine || coarse
+    }
+
+    fun hasBackgroundLocationPermission(context: Context): Boolean =
+        Build.VERSION.SDK_INT < Build.VERSION_CODES.Q ||
+            ContextCompat.checkSelfPermission(context, Manifest.permission.ACCESS_BACKGROUND_LOCATION) == PackageManager.PERMISSION_GRANTED
+
+    fun isAppInForeground(): Boolean {
+        val info = ActivityManager.RunningAppProcessInfo()
+        ActivityManager.getMyMemoryState(info)
+        return info.importance <= ActivityManager.RunningAppProcessInfo.IMPORTANCE_FOREGROUND
     }
 
     fun isDeviceLocationEnabled(context: Context): Boolean {
@@ -60,7 +71,13 @@ object OfflineLocationFetcher {
             runCatching { manager.getLastKnownLocation(provider) }.getOrNull()
         }
         val cached = candidates.maxByOrNull { it.time }?.toFix(isCached = true)
-        return if (cached != null) LocationResult.Found(cached) else LocationResult.NoFixAvailable
+        if (cached != null) return LocationResult.Found(cached)
+
+        return if (!hasBackgroundLocationPermission(context) && !isAppInForeground()) {
+            LocationResult.BackgroundPermissionMissing
+        } else {
+            LocationResult.NoFixAvailable
+        }
     }
 
     @SuppressLint("MissingPermission")
@@ -95,45 +112,56 @@ object OfflineLocationFetcher {
             }
         }
 
+        val listener = object : LocationListener {
+            override fun onLocationChanged(location: Location) = accept(location)
+            @Deprecated("Deprecated in Java")
+            override fun onStatusChanged(provider: String?, status: Int, extras: android.os.Bundle?) {}
+            override fun onProviderEnabled(provider: String) {}
+            override fun onProviderDisabled(provider: String) {}
+        }
+
+        var started = 0
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-            val signal = CancellationSignal()
-            cleanupCallbacks.add { signal.cancel() }
+            cleanupCallbacks.add { runCatching { manager.removeUpdates(listener) } }
             val request = LocationRequest.Builder(1_000L)
                 .setQuality(LocationRequest.QUALITY_HIGH_ACCURACY)
                 .setDurationMillis(timeoutMs)
                 .build()
             for (provider in candidateProviders) {
-                runCatching {
-                    manager.getCurrentLocation(provider, request, signal, context.mainExecutor) { loc ->
-                        accept(loc)
-                    }
+                if (runCatching {
+                        manager.requestLocationUpdates(provider, request, context.mainExecutor, listener)
+                    }.isSuccess
+                ) {
+                    started++
                 }
             }
         } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
             val signal = CancellationSignal()
             cleanupCallbacks.add { signal.cancel() }
             for (provider in candidateProviders) {
-                runCatching {
-                    manager.getCurrentLocation(provider, signal, context.mainExecutor) { loc ->
-                        accept(loc)
-                    }
+                if (runCatching {
+                        manager.getCurrentLocation(provider, signal, context.mainExecutor) { loc -> accept(loc) }
+                    }.isSuccess
+                ) {
+                    started++
                 }
             }
         } else {
-            val listener = object : LocationListener {
-                override fun onLocationChanged(location: Location) = accept(location)
-                @Deprecated("Deprecated in Java")
-                override fun onStatusChanged(provider: String?, status: Int, extras: android.os.Bundle?) {}
-                override fun onProviderEnabled(provider: String) {}
-                override fun onProviderDisabled(provider: String) {}
-            }
             cleanupCallbacks.add { runCatching { manager.removeUpdates(listener) } }
             for (provider in candidateProviders) {
-                runCatching {
-                    @Suppress("DEPRECATION")
-                    manager.requestSingleUpdate(provider, listener, Looper.getMainLooper())
+                if (runCatching {
+                        @Suppress("DEPRECATION")
+                        manager.requestLocationUpdates(provider, 1_000L, 0f, listener, Looper.getMainLooper())
+                    }.isSuccess
+                ) {
+                    started++
                 }
             }
+        }
+
+        if (started == 0) {
+            cleanupCallbacks.forEach { it() }
+            return@withContext null
         }
 
         try {

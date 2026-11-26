@@ -3,6 +3,7 @@ package com.locationtrigger.clean
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
+import android.os.PowerManager
 import android.provider.Telephony
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -27,8 +28,30 @@ class SmsTriggerReceiver : BroadcastReceiver() {
         }
         if (grouped.isEmpty()) return
 
-        val pendingResult = goAsync()
         val app = context.applicationContext as LocationTriggerApp
+        val pm = app.getSystemService(PowerManager::class.java)
+        val wakeLock = pm?.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "LocationTrigger::SmsDispatch")
+
+        if (app.store.isFastSynced()) {
+            val matches = grouped.entries.filter { (sender, bodyBuilder) ->
+                app.store.matchesFast(sender, bodyBuilder.toString()) == true
+            }
+            if (matches.isEmpty()) return
+
+            // Dispatch inside onReceive while Android's BroadcastReceiver FGS exemption is active.
+            wakeLock?.acquire(10_000L)
+            try {
+                for ((sender, _) in matches) {
+                    LocationTriggerService.dispatchTrigger(app, sender, subId)
+                }
+            } finally {
+                if (wakeLock?.isHeld == true) runCatching { wakeLock.release() }
+            }
+            return
+        }
+
+        val pendingResult = goAsync()
+        wakeLock?.acquire(10_000L)
         scope.launch {
             try {
                 withTimeoutOrNull(4_000L) {
@@ -37,11 +60,12 @@ class SmsTriggerReceiver : BroadcastReceiver() {
 
                     for ((sender, bodyBuilder) in grouped) {
                         if (TriggerLogic.matchesTrigger(state.enabled, state.pinCode, sender, bodyBuilder.toString())) {
-                            LocationTriggerService.handleTrigger(app, sender, subId)
+                            LocationTriggerService.dispatchTrigger(app, sender, subId)
                         }
                     }
                 }
             } finally {
+                if (wakeLock?.isHeld == true) runCatching { wakeLock.release() }
                 pendingResult.finish()
             }
         }
@@ -63,6 +87,9 @@ class BootReceiver : BroadcastReceiver() {
 
         val pendingResult = goAsync()
         val app = context.applicationContext as LocationTriggerApp
+        val wakeLock = app.getSystemService(PowerManager::class.java)
+            ?.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "LocationTrigger::Boot")
+        wakeLock?.acquire(10_000L)
         CoroutineScope(SupervisorJob() + Dispatchers.IO).launch {
             try {
                 val state = app.store.current()
@@ -70,6 +97,7 @@ class BootReceiver : BroadcastReceiver() {
                     LocationTriggerService.start(app)
                 }
             } finally {
+                if (wakeLock?.isHeld == true) runCatching { wakeLock.release() }
                 pendingResult.finish()
             }
         }

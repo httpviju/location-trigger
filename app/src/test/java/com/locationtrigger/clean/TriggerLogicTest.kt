@@ -51,6 +51,13 @@ class TriggerLogicTest {
         )
         assertTrue(permMissing.contains("Location permission not granted"))
 
+        val bgPermMissing = TriggerLogic.formatLocationReply(
+            LocationResult.BackgroundPermissionMissing,
+            batteryPercent = 20,
+            nowMillis = 1_700_000_000_000L
+        )
+        assertTrue(bgPermMissing.contains("Allow all the time"))
+
         val unavailable = TriggerLogic.formatLocationReply(
             LocationResult.NoFixAvailable,
             batteryPercent = 20,
